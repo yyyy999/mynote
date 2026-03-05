@@ -328,9 +328,140 @@ TileScale 是 TileLang 的**超集扩展**:
 
 ---
 
-## 八、分布式示例分析
+## 八、单机与多机部署
 
-### 8.1 示例概览
+### 8.1 支持的部署模式
+
+| 模式 | 说明 | 通信方式 | 支持状态 |
+|------|------|----------|----------|
+| 单机单卡 | WORLD_SIZE=1 | 无需通信 | ✅ 完全支持 |
+| 单机多卡 | 同一节点内多GPU | NVLink/PCIe + NVSHMEM | ✅ 完全支持 |
+| 多机多卡 | 跨节点多GPU | InfiniBand + NCCL + NVSHMEM | ✅ 架构支持 |
+
+### 8.2 环境变量配置
+
+TileScale 通过环境变量区分单机与多机部署：
+
+```bash
+# 单机多卡 (默认)
+NODES=1                    # 节点数 = 1
+GPUS=8                     # 每节点 GPU 数
+NODE_RANK=0                # 节点编号 = 0
+
+# 多机多卡
+NODES=4                    # 4 个节点
+GPUS=8                     # 每节点 8 GPU
+NODE_RANK=0/1/2/3         # 各节点编号
+MASTER_ADDR=10.0.0.1      # 主节点 IP
+MASTER_PORT=8361          # 通信端口
+```
+
+### 8.3 代码中的区分逻辑
+
+```python
+# tilelang/distributed/utils.py
+
+def init_distributed(...):
+    # 全局 rank (跨节点唯一标识)
+    RANK = int(os.environ.get("RANK", 0))
+    # 全局进程数 (所有节点的 GPU 总数)
+    WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
+    # 节点内 rank (当前节点内的 GPU 编号)
+    LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
+    # 节点内 GPU 数
+    LOCAL_WORLD_SIZE = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
+    
+    # 创建本地通信组 (同节点内 GPU，使用 NVLink)
+    if return_lc_group:
+        base = (RANK // local_world_size) * local_world_size
+        LC_GROUP = torch.distributed.new_group(
+            list(range(base, base + local_world_size))
+        )
+```
+
+### 8.4 通信方式对比
+
+| 场景 | 通信介质 | 底层技术 | 带宽 | 延迟 |
+|------|----------|----------|------|------|
+| 单机多卡 | NVLink | NVSHMEM 对称堆 | 900GB/s | ~5μs |
+| 单机多卡 | PCIe | NVSHMEM 对称堆 | 64GB/s | ~10μs |
+| 多机多卡 | InfiniBand | NCCL + NVSHMEM over IB | 400Gb/s | ~1μs + 网络 |
+
+### 8.5 运行方式
+
+#### 单机多卡
+```bash
+# 方式1: 使用 launch.sh (默认单机)
+./tilelang/distributed/launch.sh your_script.py
+
+# 方式2: 直接 torchrun
+torchrun --nproc_per_node=8 your_script.py
+
+# 方式3: 指定 GPU 数
+GPUS=4 ./tilelang/distributed/launch.sh your_script.py
+```
+
+#### 多机多卡
+```bash
+# 节点 0 (主节点)
+NODES=2 NODE_RANK=0 MASTER_ADDR=10.0.0.1 \
+  ./tilelang/distributed/launch.sh your_script.py
+
+# 节点 1 (从节点)
+NODES=2 NODE_RANK=1 MASTER_ADDR=10.0.0.1 \
+  ./tilelang/distributed/launch.sh your_script.py
+```
+
+### 8.6 launch.sh 脚本解析
+
+```bash
+#!/bin/bash
+# tilelang/distributed/launch.sh
+
+# 启用分布式模式
+export TILELANG_USE_NVSHMEM=1
+export TILELANG_USE_DISTRIBUTED=1
+
+# 配置 NCCL
+export NCCL_DEBUG="WARN"
+
+# 启动参数
+nproc_per_node=${GPUS:=$(nvidia-smi --list-gpus | wc -l)}  # 每节点 GPU 数
+nnodes=${NODES:=1}                                          # 节点数
+node_rank=${NODE_RANK:=0}                                   # 当前节点编号
+master_addr=${MASTER_ADDR:="127.0.0.1"}                     # 主节点地址
+
+# 使用 torch.distributed.run 启动
+python -m torch.distributed.run \
+  --node_rank=${node_rank} \
+  --nproc_per_node=${nproc_per_node} \
+  --nnodes=${nnodes} \
+  $@
+```
+
+### 8.7 Rank 编号规则
+
+```
+多机多卡示例 (2节点 × 4GPU):
+
+节点0:                    节点1:
+┌─────────────────┐      ┌─────────────────┐
+│ GPU0: RANK=0    │      │ GPU0: RANK=4    │
+│ GPU1: RANK=1    │      │ GPU1: RANK=5    │
+│ GPU2: RANK=2    │      │ GPU2: RANK=6    │
+│ GPU3: RANK=3    │      │ GPU3: RANK=7    │
+└─────────────────┘      └─────────────────┘
+  LOCAL_RANK: 0-3          LOCAL_RANK: 0-3
+  NODE_RANK: 0             NODE_RANK: 1
+
+RANK = NODE_RANK * LOCAL_WORLD_SIZE + LOCAL_RANK
+```
+
+---
+
+## 九、分布式示例分析
+
+### 9.1 示例概览
 
 | 示例 | 功能 | 通信模式 | 应用场景 |
 |------|------|----------|----------|
@@ -347,9 +478,9 @@ TileScale 是 TileLang 的**超集扩展**:
 
 ---
 
-### 8.2 核心示例详解
+### 9.2 核心示例详解
 
-#### 8.2.1 AllGather 示例
+#### 9.2.1 AllGather 示例
 
 **文件**: [example_allgather.py](file:///d:/work/tilescale/examples/distributed/example_allgather.py)
 
@@ -545,7 +676,7 @@ for ko in T.serial(MESH):
 
 ---
 
-#### 8.2.5 Cannon 分布式矩阵乘
+#### 9.2.5 Cannon 分布式矩阵乘
 
 **文件**: [example_cannon.py](file:///d:/work/tilescale/examples/distributed/example_cannon.py)
 
@@ -652,7 +783,7 @@ torchrun --nproc_per_node=4 examples/distributed/example_allgather.py
 
 ---
 
-### 8.4 关键 API 总结
+### 9.4 关键 API 总结
 
 | API | 功能 | 级别 |
 |-----|------|------|
